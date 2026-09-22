@@ -19,6 +19,21 @@ database installation are not needed.
 6. Results show the tag, file name, and full path. Double-click a row to select
    its file in Windows Explorer.
 
+### Copy result fields
+
+Right-click a result and choose **Copy tag name**, **Copy file name**, or
+**Copy full path**. **Copy clicked field** copies just the column you clicked;
+you can also click a cell and press **Ctrl+C**. **Copy entire row** copies all
+three fields separated by tabs, ready to paste into a spreadsheet. Unicode file
+names and special characters are preserved.
+
+For keyboard use, select a row with the arrow keys and press **Shift+F10** or
+the Menu key to choose which field to copy. Ctrl+C uses the last clicked column
+(the tag-name column by default).
+
+The executable includes a paper-sheet-and-atoms icon for Explorer, the taskbar,
+and the application window; no external icon file is needed to run it.
+
 **Scans are saved automatically** to `tags.sqlite3` beside `TagFinder.exe`.
 On later launches you can search immediately without scanning again. The last
 successfully scanned folder and subfolder option are remembered in the database.
@@ -112,6 +127,13 @@ environment:
 
 ```sh
 bash build.sh
+```
+
+The build embeds `icon.ico` using LLVM MinGW's `windres`. To regenerate the
+multi-resolution icon from its editable SVG source with ImageMagick:
+
+```sh
+magick -background none icon.svg -define icon:auto-resize=256,128,64,48,32,24,16 icon.ico
 ```
 
 The SQLite 3.38.2 amalgamation is vendored as `sqlite3.c` and `sqlite3.h`, obtained

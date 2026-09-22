@@ -11,6 +11,7 @@
 #include <atomic>
 #include <memory>
 #include <stdexcept>
+#include <cstring>
 #include "sqlite3.h"
 #include "extract.h"
 
@@ -23,6 +24,8 @@ bool lastScanRecursive = true;
 std::atomic<bool> busy{false};
 constexpr UINT Done = WM_APP + 1;
 constexpr UINT Progress = WM_APP + 2;
+int selectedColumn = 0;
+constexpr UINT CopyField = 40, CopyTag = 41, CopyFileName = 42, CopyPath = 43, CopyRow = 44;
 std::wstring text(HWND h) {
     int n = GetWindowTextLengthW(h);
     std::wstring s(n + 1, L'\0'); GetWindowTextW(h, s.data(), n + 1); s.resize(n); return s;
@@ -126,9 +129,72 @@ void search() {
             ++count;
         }
         if (rc != SQLITE_DONE && rc != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(db.p));
-        std::wstring msg = std::to_wstring(count) + (rc == SQLITE_ROW ? L" results shown (limit reached). Refine your search." : L" tag/file matches. Double-click a row to locate the file.");
+        std::wstring msg = std::to_wstring(count) + (rc == SQLITE_ROW ? L" results shown (limit reached). Refine your search." : L" tag/file matches. Right-click to copy a field; double-click to locate the file.");
         SetWindowTextW(statusBox, msg.c_str());
     } catch (const std::exception& e) { MessageBoxW(window, wide(e.what()).c_str(), L"Search error", MB_ICONERROR); }
+}
+std::wstring resultField(int row, int column) {
+    std::vector<wchar_t> buffer(256);
+    for (;;) {
+        LVITEMW item{}; item.iSubItem = column; item.pszText = buffer.data(); item.cchTextMax = int(buffer.size());
+        int count = int(SendMessageW(results, LVM_GETITEMTEXTW, WPARAM(row), LPARAM(&item)));
+        if (count < int(buffer.size()) - 1) return std::wstring(buffer.data(), count);
+        buffer.resize(buffer.size() * 2);
+    }
+}
+void copyResult(UINT command) {
+    int row = ListView_GetNextItem(results, -1, LVNI_SELECTED);
+    if (row < 0) { SetWindowTextW(statusBox, L"Select a result first, then right-click to choose a field to copy."); return; }
+    int column = command == CopyField ? selectedColumn : int(command - CopyTag);
+    std::wstring value = command == CopyRow
+        ? resultField(row, 0) + L"\t" + resultField(row, 1) + L"\t" + resultField(row, 2)
+        : resultField(row, column);
+    SIZE_T bytes = (value.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory) { MessageBoxW(window, L"Not enough memory to copy the selected field.", L"Copy failed", MB_ICONERROR); return; }
+    void* destination = GlobalLock(memory);
+    if (!destination) { GlobalFree(memory); MessageBoxW(window, L"Cannot prepare clipboard text.", L"Copy failed", MB_ICONERROR); return; }
+    std::memcpy(destination, value.c_str(), bytes); GlobalUnlock(memory);
+    bool copied = false;
+    if (OpenClipboard(window)) {
+        if (EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, memory)) copied = true;
+        CloseClipboard();
+    }
+    if (!copied) {
+        GlobalFree(memory);
+        MessageBoxW(window, L"Cannot access the clipboard. Please try again.", L"Copy failed", MB_ICONERROR);
+        return;
+    }
+    const wchar_t* labels[] = {L"Tag name copied.", L"File name copied.", L"Full path copied."};
+    SetWindowTextW(statusBox, command == CopyRow ? L"Row copied (tab-separated)." : labels[column]);
+}
+void copyMenu(LPARAM location) {
+    POINT point{int(short(LOWORD(location))), int(short(HIWORD(location)))};
+    if (point.x == -1 && point.y == -1) {
+        int row = ListView_GetNextItem(results, -1, LVNI_SELECTED);
+        if (row < 0) return;
+        RECT rect{}; ListView_GetItemRect(results, row, &rect, LVIR_BOUNDS);
+        point = {rect.left + 12, rect.bottom}; ClientToScreen(results, &point);
+    } else {
+        LVHITTESTINFO hit{}; hit.pt = point; ScreenToClient(results, &hit.pt);
+        int row = ListView_SubItemHitTest(results, &hit);
+        if (row < 0 || hit.iSubItem < 0 || hit.iSubItem > 2) return;
+        selectedColumn = hit.iSubItem;
+        ListView_SetItemState(results, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_SetItemState(results, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    }
+    SetFocus(results);
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, CopyField, L"Copy clicked field\tCtrl+C");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, CopyTag, L"Copy tag name");
+    AppendMenuW(menu, MF_STRING, CopyFileName, L"Copy file name");
+    AppendMenuW(menu, MF_STRING, CopyPath, L"Copy full path");
+    AppendMenuW(menu, MF_STRING, CopyRow, L"Copy entire row");
+    UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
+    DestroyMenu(menu);
+    if (command) copyResult(command);
 }
 HWND control(const wchar_t* cls, const wchar_t* title, DWORD style, int id) {
     HWND h = CreateWindowExW(cls == std::wstring(L"EDIT") ? WS_EX_CLIENTEDGE : 0, cls, title,
@@ -171,6 +237,7 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         auto* info = reinterpret_cast<MINMAXINFO*>(lp); info->ptMinTrackSize = {720, 400}; return 0;
     }
     case WM_COMMAND:
+        if (LOWORD(wp) >= CopyField && LOWORD(wp) <= CopyRow) { copyResult(LOWORD(wp)); return 0; }
         if (LOWORD(wp) == 11) {
             IFileDialog* dialog = nullptr;
             if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
@@ -194,7 +261,14 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             std::thread(scan, fs::absolute(fs::path(root)).lexically_normal().wstring(), recursive).detach();
         } else if (LOWORD(wp) == 15) search();
         return 0;
+    case WM_CONTEXTMENU:
+        if (reinterpret_cast<HWND>(wp) == results) { copyMenu(lp); return 0; }
+        break;
     case WM_NOTIFY:
+        if (reinterpret_cast<NMHDR*>(lp)->idFrom == 17 && reinterpret_cast<NMHDR*>(lp)->code == NM_CLICK) {
+            auto* item = reinterpret_cast<NMITEMACTIVATE*>(lp);
+            if (item->iItem >= 0 && item->iSubItem >= 0 && item->iSubItem <= 2) selectedColumn = item->iSubItem;
+        }
         if (reinterpret_cast<NMHDR*>(lp)->idFrom == 17 && reinterpret_cast<NMHDR*>(lp)->code == NM_DBLCLK) {
             int row = ListView_GetNextItem(results, -1, LVNI_SELECTED);
             if (row >= 0) {
@@ -246,12 +320,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             if (rc != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(db.p));
         }
         WNDCLASSW wc{}; wc.lpfnWndProc = proc; wc.hInstance = instance; wc.lpszClassName = L"LayoutTagFinder";
+        wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(101));
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = HBRUSH(COLOR_BTNFACE+1); RegisterClassW(&wc);
         HWND h = CreateWindowW(wc.lpszClassName, L"Layout Tag Finder", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1100, 680, nullptr, nullptr, instance, nullptr);
         if (!h) throw std::runtime_error("Cannot create window");
+        SendMessageW(h, WM_SETICON, ICON_SMALL, LPARAM(LoadImageW(instance, MAKEINTRESOURCEW(101), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED)));
         ShowWindow(h, show);
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            if (msg.message == WM_KEYDOWN && msg.wParam == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)
+                && GetFocus() == results) { copyResult(CopyField); continue; }
             if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && GetFocus() == queryBox && !busy) { search(); continue; }
             if (!IsDialogMessageW(h, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
         }
