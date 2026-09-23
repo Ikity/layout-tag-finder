@@ -1,1 +1,2 @@
+// Resource 101 is loaded by wWinMain and shown by Explorer without running the app.
 101 ICON "icon.ico"

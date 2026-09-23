@@ -1,6 +1,14 @@
 # Layout Tag Finder
 
+[English](README.md) | [Русский](README.ru.md)
+
+**Technical documentation:** [Architecture and functions](ARCHITECTURE.md) ·
+[SQLite schema](DATABASE.md) · [Архитектура и функции](ARCHITECTURE.ru.md) ·
+[Схема SQLite](DATABASE.ru.md)
+
 A small native Windows x64 GUI for finding which layout files contain a tag name.
+
+[Download the Windows executable](https://github.com/Ikity/layout-tag-finder/releases/latest)
 
 ## Run
 
@@ -106,7 +114,7 @@ database even when those locations are unavailable. To locate files in Explorer
 or refresh an index after moving the source files, select their new folder and
 scan again.
 
-Schema (scan preferences are stored in an additional `settings` table):
+Schema:
 
 ```sql
 CREATE TABLE uses (
@@ -115,7 +123,19 @@ CREATE TABLE uses (
     PRIMARY KEY (tag, path)
 );
 CREATE INDEX tag_lookup ON uses(tag COLLATE NOCASE);
+CREATE TABLE settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ```
+
+`uses` stores one row per tag/full-path pair. A tag can belong to many files,
+and a file can contain many tags. The composite primary key removes repeated
+occurrences within one file. `tag_lookup` speeds up case-insensitive exact search.
+`settings` stores `scan_folder` and `scan_recursive` (`"1"` or `"0"`) from the
+last successful scan. Both tables are updated in one transaction when rescanning.
+
+See [DATABASE.md](DATABASE.md) for examples, queries, case rules and rollback behavior.
 
 Close the app before copying or deleting the database. Source layout files are
 opened only for reading.

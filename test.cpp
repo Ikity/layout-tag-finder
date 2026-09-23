@@ -5,7 +5,10 @@
 #include <filesystem>
 #include <chrono>
 
+// Native command-line checks, independent of Win32. Keep assertions enabled:
+// some assert expressions execute SQLite calls as well as verify their results.
 int main() {
+    // Synthetic binary strings cover photo-style names, duplicates and UTF-8.
     std::string input = "\x01Me.UPSStatus_BF\x00";
     std::vector<unsigned char> bytes(input.begin(), input.end());
     auto append = [&](const std::string& s) { bytes.push_back(0); bytes.insert(bytes.end(), s.begin(), s.end()); bytes.push_back(0); };
@@ -14,6 +17,7 @@ int main() {
     auto tags = extractTags(bytes);
     assert(tags.size() == 3);
     assert(tags.count("Me.UPSStatus_BF")); assert(tags.count("Me.Battery_LifeTimeStatus_BF")); assert(tags.count("$Pump-01.Status"));
+    // Test both UTF-16 byte orders and a mixed-script continuation of a name.
     for (bool be : {false, true}) {
         std::vector<unsigned char> data{0, 0};
         for (unsigned char c : std::string("$Motor_1.Run")) { data.push_back(be ? 0 : c); data.push_back(be ? c : 0); }
@@ -26,6 +30,7 @@ int main() {
     }
     assert(extractTags({}).empty());
     assert(extractTags(std::vector<unsigned char>(1048576, 0)).empty());
+    // In-memory tests check the schema/query contract, not the Windows UI.
     sqlite3* db = nullptr; assert(sqlite3_open(":memory:", &db) == SQLITE_OK);
     auto exec = [&](const char* sql) { assert(sqlite3_exec(db, sql, nullptr, nullptr, nullptr) == SQLITE_OK); };
     exec("CREATE TABLE uses(tag TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(tag,path));"

@@ -1,3 +1,6 @@
+// Layout Tag Finder: Win32 interface + background scanner + portable SQLite index.
+// Start at wWinMain(), then follow proc() for UI events and scan() for indexing.
+// See ARCHITECTURE.md / ARCHITECTURE.ru.md for the complete call and data flow.
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -16,28 +19,39 @@
 #include "extract.h"
 
 namespace fs = std::filesystem;
+// Controls belong to the main UI thread. The worker reports progress with posted
+// messages; it never changes a control directly. databasePath is set at startup.
 HWND window, folderBox, recursiveBox, queryBox, exactBox, results, statusBox;
 HWND browseButton, scanButton, searchButton;
 std::wstring databasePath;
 std::wstring lastScanFolder;
 bool lastScanRecursive = true;
 std::atomic<bool> busy{false};
+// Progress carries a file count in WPARAM. Done transfers ownership of a heap
+// std::wstring in LPARAM; proc() takes it into a unique_ptr and releases it.
 constexpr UINT Done = WM_APP + 1;
 constexpr UINT Progress = WM_APP + 2;
 int selectedColumn = 0;
 constexpr UINT CopyField = 40, CopyTag = 41, CopyFileName = 42, CopyPath = 43, CopyRow = 44;
+// Win32 controls use UTF-16 strings. Include space for the terminating NUL while
+// reading a control, then remove that extra character from the returned string.
 std::wstring text(HWND h) {
     int n = GetWindowTextLengthW(h);
     std::wstring s(n + 1, L'\0'); GetWindowTextW(h, s.data(), n + 1); s.resize(n); return s;
 }
+// SQLite's char-based API stores UTF-8; filesystem and GUI paths stay UTF-16.
 std::string utf8(const std::wstring& s) {
     int n = WideCharToMultiByte(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0, nullptr, nullptr);
     std::string r(n, 0); WideCharToMultiByte(CP_UTF8, 0, s.data(), int(s.size()), r.data(), n, nullptr, nullptr); return r;
 }
+// Convert database results/errors back to text accepted by the Win32 W APIs.
 std::wstring wide(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
     std::wstring r(n, 0); MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), r.data(), n); return r;
 }
+// Own one SQLite connection (RAII: destruction closes it, including on errors).
+// Startup, scanning and searching use separate connections. An uncommitted
+// scan is rolled back when its statements are finalized and this connection closes.
 struct DB {
     sqlite3* p = nullptr;
     DB() {
@@ -48,29 +62,39 @@ struct DB {
     ~DB() { sqlite3_close(p); }
     void exec(const char* sql) { if (sqlite3_exec(p, sql, nullptr, nullptr, nullptr) != SQLITE_OK) throw std::runtime_error(sqlite3_errmsg(p)); }
 };
+// Own a compiled SQL statement. Values are bound, never concatenated into SQL.
+// SQLITE_TRANSIENT makes SQLite copy the string, so temporary inputs are safe.
 struct Statement {
     sqlite3_stmt* p = nullptr;
     Statement(DB& db, const char* sql) { if (sqlite3_prepare_v2(db.p, sql, -1, &p, nullptr) != SQLITE_OK) throw std::runtime_error(sqlite3_errmsg(db.p)); }
     ~Statement() { sqlite3_finalize(p); }
     void bind(int n, const std::string& s) { if (sqlite3_bind_text(p, n, s.c_str(), int(s.size()), SQLITE_TRANSIENT) != SQLITE_OK) throw std::runtime_error("Cannot bind database value"); }
+    // Execute a write, then reuse the same prepared statement for the next row.
     void insert() { if (sqlite3_step(p) != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(sqlite3_db_handle(p))); sqlite3_reset(p); sqlite3_clear_bindings(p); }
 };
+// Freeze scan/search inputs while a worker owns the index-replacement operation.
 void enabled(bool value) {
     for (HWND h : {folderBox, recursiveBox, queryBox, exactBox, browseButton, scanButton, searchButton}) EnableWindow(h, value);
 }
+// Worker-thread entry point. Each successful scan replaces the whole index, not
+// just changed files. The transaction makes deletion + new rows + settings atomic.
 void scan(std::wstring root, bool recursive) {
     std::wstring message;
     try {
         DB db;
+        // Reserve the writer before deleting. Until COMMIT, failure preserves the
+        // previous on-disk index; individual unreadable files are instead skipped.
         db.exec("BEGIN IMMEDIATE; DELETE FROM uses;");
         Statement add(db, "INSERT OR IGNORE INTO uses(tag,path) VALUES(?,?)");
         size_t indexed = 0, large = 0, unreadable = 0, links = 0;
+        // Both recursive and single-folder traversal share these filtering rules.
         auto visit = [&](const fs::directory_entry& entry) {
             std::error_code ec;
             if (entry.is_symlink(ec)) { ++links; return; }
             if (!entry.is_regular_file(ec)) { if (ec) ++unreadable; return; }
             fs::path path = entry.path();
             std::wstring p = path.wstring();
+            // Avoid indexing our own database and temporary SQLite sidecars.
             if (_wcsicmp(p.c_str(), databasePath.c_str()) == 0
                 || _wcsicmp(p.c_str(), (databasePath + L"-journal").c_str()) == 0
                 || _wcsicmp(p.c_str(), (databasePath + L"-wal").c_str()) == 0
@@ -88,6 +112,8 @@ void scan(std::wstring root, bool recursive) {
             if (data.size() > 1048576) { ++large; return; }
             auto tags = extractTags(data);
             std::string filePath = utf8(p);
+            // extractTags() deduplicates within this file; the composite SQL key
+            // also prevents repeating the same tag/path pair across inserts.
             for (const auto& tag : tags) { add.bind(1, tag); add.bind(2, filePath); add.insert(); }
             ++indexed;
             if (indexed % 25 == 0) PostMessageW(window, Progress, indexed, 0);
@@ -97,6 +123,7 @@ void scan(std::wstring root, bool recursive) {
         } else {
             for (const auto& entry : fs::directory_iterator(fs::path(root))) visit(entry);
         }
+        // Save preferences in the same transaction, so they describe this index.
         Statement settings(db, "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)");
         settings.bind(1, "scan_folder"); settings.bind(2, utf8(root)); settings.insert();
         settings.bind(1, "scan_recursive"); settings.bind(2, recursive ? "1" : "0"); settings.insert();
@@ -106,6 +133,7 @@ void scan(std::wstring root, bool recursive) {
     } catch (const std::exception& e) { message = L"Scan failed; previous index retained. " + wide(e.what()); }
     PostMessageW(window, Done, 0, reinterpret_cast<LPARAM>(new std::wstring(message)));
 }
+// UI-thread query of saved data only: searching never reads the source files.
 void search() {
     try {
         DB db;
@@ -113,6 +141,9 @@ void search() {
         std::string q = utf8(text(queryBox));
         ListView_DeleteAllItems(results);
         if (q.empty()) { SetWindowTextW(statusBox, L"Enter a tag name to search."); return; }
+        // instr(), unlike LIKE, treats '_' and '%' literally. Fetch one extra row
+        // to detect that the 5,000-row display limit was reached. Exact lookup can
+        // use the NOCASE index; substring matching scans candidate tag strings.
         Statement s(db, exact ? "SELECT tag,path FROM uses WHERE tag=? COLLATE NOCASE ORDER BY tag,path LIMIT 5001"
                             : "SELECT tag,path FROM uses WHERE instr(lower(tag),lower(?))>0 ORDER BY tag,path LIMIT 5001");
         s.bind(1, q);
@@ -133,6 +164,8 @@ void search() {
         SetWindowTextW(statusBox, msg.c_str());
     } catch (const std::exception& e) { MessageBoxW(window, wide(e.what()).c_str(), L"Search error", MB_ICONERROR); }
 }
+// Read the full cell value, growing the buffer instead of truncating long paths
+// or tag strings. This is the shared source for all clipboard actions.
 std::wstring resultField(int row, int column) {
     std::vector<wchar_t> buffer(256);
     for (;;) {
@@ -142,6 +175,7 @@ std::wstring resultField(int row, int column) {
         buffer.resize(buffer.size() * 2);
     }
 }
+// Copy one selected row's field, or its three tab-separated fields, as Unicode.
 void copyResult(UINT command) {
     int row = ListView_GetNextItem(results, -1, LVNI_SELECTED);
     if (row < 0) { SetWindowTextW(statusBox, L"Select a result first, then right-click to choose a field to copy."); return; }
@@ -156,6 +190,7 @@ void copyResult(UINT command) {
     if (!destination) { GlobalFree(memory); MessageBoxW(window, L"Cannot prepare clipboard text.", L"Copy failed", MB_ICONERROR); return; }
     std::memcpy(destination, value.c_str(), bytes); GlobalUnlock(memory);
     bool copied = false;
+    // On success Windows owns this allocation. Free it ourselves only on failure.
     if (OpenClipboard(window)) {
         if (EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, memory)) copied = true;
         CloseClipboard();
@@ -168,6 +203,8 @@ void copyResult(UINT command) {
     const wchar_t* labels[] = {L"Tag name copied.", L"File name copied.", L"Full path copied."};
     SetWindowTextW(statusBox, command == CopyRow ? L"Row copied (tab-separated)." : labels[column]);
 }
+// Mouse invocation selects the row/column under the pointer. Keyboard invocation
+// uses the current selection; (-1,-1) is Win32's keyboard-menu position marker.
 void copyMenu(LPARAM location) {
     POINT point{int(short(LOWORD(location))), int(short(HIWORD(location)))};
     if (point.x == -1 && point.y == -1) {
@@ -196,11 +233,14 @@ void copyMenu(LPARAM location) {
     DestroyMenu(menu);
     if (command) copyResult(command);
 }
+// Create a child control with the shared GUI font and an ID used by proc().
 HWND control(const wchar_t* cls, const wchar_t* title, DWORD style, int id) {
     HWND h = CreateWindowExW(cls == std::wstring(L"EDIT") ? WS_EX_CLIENTEDGE : 0, cls, title,
         WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, window, HMENU(INT_PTR(id)), nullptr, nullptr);
     SendMessageW(h, WM_SETFONT, WPARAM(GetStockObject(DEFAULT_GUI_FONT)), TRUE); return h;
 }
+// Main event dispatcher: construct/resize controls, handle user actions, consume
+// worker notifications, and coordinate shutdown. Only this thread updates the UI.
 LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -258,6 +298,8 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (root.empty() || !fs::is_directory(fs::path(root), ec)) { MessageBoxW(h, L"Choose an existing folder first.", L"Tag Finder", MB_ICONINFORMATION); return 0; }
             busy = true; enabled(false); SetWindowTextW(statusBox, L"Scanning... The saved index will be replaced when the scan succeeds.");
             bool recursive = SendMessageW(recursiveBox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            // Pass copies of the inputs. WM_CLOSE keeps the window alive until
+            // this detached worker has posted Done and the UI has processed it.
             std::thread(scan, fs::absolute(fs::path(root)).lexically_normal().wstring(), recursive).detach();
         } else if (LOWORD(wp) == 15) search();
         return 0;
@@ -283,6 +325,7 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         std::wstring s = L"Scanning... " + std::to_wstring(wp) + L" files indexed."; SetWindowTextW(statusBox, s.c_str()); return 0;
     }
     case Done: {
+        // Release the worker's message allocation and allow the next operation.
         std::unique_ptr<std::wstring> s(reinterpret_cast<std::wstring*>(lp)); busy = false; enabled(true);
         ListView_DeleteAllItems(results); SetWindowTextW(statusBox, s->c_str()); return 0;
     }
@@ -293,6 +336,8 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
+// Windows GUI entry point: initialize COM/common controls, locate the portable
+// database, ensure its schema, restore preferences, then run the message loop.
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     SetProcessDPIAware();
@@ -302,8 +347,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         DWORD length = GetModuleFileNameW(nullptr, executable.data(), DWORD(executable.size()));
         if (!length || length >= executable.size()) throw std::runtime_error("Cannot locate the executable folder");
         fs::path dir = fs::path(std::wstring(executable.data(), length)).parent_path();
+        // Resolve beside the EXE, not beside the process's current working folder.
         databasePath = (dir / L"tags.sqlite3").wstring();
         DB db;
+        // DELETE journaling leaves one portable database after a clean commit.
+        // CREATE IF NOT EXISTS also opens older indexes without discarding data.
         db.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;"
                 "CREATE TABLE IF NOT EXISTS uses(tag TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(tag,path));"
                 "CREATE INDEX IF NOT EXISTS tag_lookup ON uses(tag COLLATE NOCASE);"
@@ -328,6 +376,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED)));
         ShowWindow(h, show);
         MSG msg;
+        // Handle app shortcuts before dialog-style Tab navigation and dispatch.
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
             if (msg.message == WM_KEYDOWN && msg.wParam == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)
                 && GetFocus() == results) { copyResult(CopyField); continue; }
