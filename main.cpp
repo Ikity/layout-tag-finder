@@ -23,9 +23,12 @@ namespace fs = std::filesystem;
 // messages; it never changes a control directly. databasePath is set at startup.
 HWND window, folderBox, recursiveBox, queryBox, exactBox, results, statusBox;
 HWND browseButton, scanButton, searchButton;
+HWND hideExtBox, hidePathBox;
 std::wstring databasePath;
 std::wstring lastScanFolder;
 bool lastScanRecursive = true;
+bool hideExtensions = true;
+bool hideFullPath = true;
 std::atomic<bool> busy{false};
 // Progress carries a file count in WPARAM. Done transfers ownership of a heap
 // std::wstring in LPARAM; proc() takes it into a unique_ptr and releases it.
@@ -127,6 +130,8 @@ void scan(std::wstring root, bool recursive) {
         Statement settings(db, "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)");
         settings.bind(1, "scan_folder"); settings.bind(2, utf8(root)); settings.insert();
         settings.bind(1, "scan_recursive"); settings.bind(2, recursive ? "1" : "0"); settings.insert();
+        settings.bind(1, "hide_extensions"); settings.bind(2, hideExtensions ? "1" : "0"); settings.insert();
+        settings.bind(1, "hide_full_path"); settings.bind(2, hideFullPath ? "1" : "0"); settings.insert();
         db.exec("COMMIT;");
         message = L"Scan saved to tags.sqlite3: " + std::to_wstring(indexed) + L" files indexed; " + std::to_wstring(large)
                 + L" over 1 MB; " + std::to_wstring(unreadable) + L" unreadable; " + std::to_wstring(links) + L" links skipped.";
@@ -138,6 +143,8 @@ void search() {
     try {
         DB db;
         bool exact = SendMessageW(exactBox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        hideExtensions = SendMessageW(hideExtBox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        hideFullPath = SendMessageW(hidePathBox, BM_GETCHECK, 0, 0) == BST_CHECKED;
         std::string q = utf8(text(queryBox));
         ListView_DeleteAllItems(results);
         if (q.empty()) { SetWindowTextW(statusBox, L"Enter a tag name to search."); return; }
@@ -155,11 +162,17 @@ void search() {
             LVITEMW item{}; item.mask = LVIF_TEXT; item.iItem = count; item.pszText = tag.data();
             int row = ListView_InsertItem(results, &item);
             auto name = fs::path(path).filename().wstring();
+            if (hideExtensions) {
+                auto dot = name.rfind(L'.');
+                if (dot != std::wstring::npos) name = name.substr(0, dot);
+            }
             ListView_SetItemText(results, row, 1, name.data());
             ListView_SetItemText(results, row, 2, path.data());
             ++count;
         }
         if (rc != SQLITE_DONE && rc != SQLITE_ROW) throw std::runtime_error(sqlite3_errmsg(db.p));
+        if (hideFullPath) ListView_SetColumnWidth(results, 2, 0);
+        else ListView_SetColumnWidth(results, 2, 540);
         std::wstring msg = std::to_wstring(count) + (rc == SQLITE_ROW ? L" results shown (limit reached). Refine your search." : L" tag/file matches. Right-click to copy a field; double-click to locate the file.");
         SetWindowTextW(statusBox, msg.c_str());
     } catch (const std::exception& e) { MessageBoxW(window, wide(e.what()).c_str(), L"Search error", MB_ICONERROR); }
@@ -254,6 +267,10 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(queryBox, EM_SETCUEBANNER, 0, LPARAM(L"Tag name, e.g. Me.UPSStatus_BF"));
         searchButton = control(L"BUTTON", L"Search", WS_TABSTOP, 15);
         exactBox = control(L"BUTTON", L"Exact name", BS_AUTOCHECKBOX | WS_TABSTOP, 16);
+        hideExtBox = control(L"BUTTON", L"Hide file extensions", BS_AUTOCHECKBOX | WS_TABSTOP, 19);
+        SendMessageW(hideExtBox, BM_SETCHECK, hideExtensions ? BST_CHECKED : BST_UNCHECKED, 0);
+        hidePathBox = control(L"BUTTON", L"Hide full path column", BS_AUTOCHECKBOX | WS_TABSTOP, 20);
+        SendMessageW(hidePathBox, BM_SETCHECK, hideFullPath ? BST_CHECKED : BST_UNCHECKED, 0);
         results = control(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | WS_TABSTOP, 17);
         ListView_SetExtendedListViewStyle(results, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
         int col = 0;
@@ -261,6 +278,7 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             LVCOLUMNW c{}; c.mask = LVCF_TEXT | LVCF_WIDTH; c.pszText = const_cast<wchar_t*>(title); c.cx = col == 2 ? 540 : 250;
             ListView_InsertColumn(results, col++, &c);
         }
+        if (hideFullPath) ListView_SetColumnWidth(results, 2, 0);
         statusBox = control(L"STATIC", L"Search the saved tags.sqlite3 index anytime. Scan / replace index refreshes it when your files change.", 0, 18);
         return 0;
     }
@@ -271,7 +289,9 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         MoveWindow(recursiveBox, 12, 47, 220, 24, TRUE);
         MoveWindow(queryBox, 12, 80, w-266, 28, TRUE); MoveWindow(searchButton, w-246, 80, 96, 28, TRUE);
         MoveWindow(exactBox, w-140, 80, 128, 28, TRUE);
-        MoveWindow(results, 12, 120, w-24, height-170, TRUE); MoveWindow(statusBox, 12, height-42, w-24, 36, TRUE); return 0;
+        MoveWindow(hideExtBox, 12, 110, 220, 24, TRUE);
+        MoveWindow(hidePathBox, 240, 110, 220, 24, TRUE);
+        MoveWindow(results, 12, 140, w-24, height-190, TRUE); MoveWindow(statusBox, 12, height-42, w-24, 36, TRUE); return 0;
     }
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lp); info->ptMinTrackSize = {720, 400}; return 0;
@@ -302,6 +322,21 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             // this detached worker has posted Done and the UI has processed it.
             std::thread(scan, fs::absolute(fs::path(root)).lexically_normal().wstring(), recursive).detach();
         } else if (LOWORD(wp) == 15) search();
+        else if (LOWORD(wp) == 19 || LOWORD(wp) == 20) {
+            hideExtensions = SendMessageW(hideExtBox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            hideFullPath = SendMessageW(hidePathBox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            if (hideFullPath) ListView_SetColumnWidth(results, 2, 0);
+            else ListView_SetColumnWidth(results, 2, 540);
+            if (hideExtensions) search(); // refresh display to apply extension hiding
+            // Save display preferences immediately
+            try {
+                DB db;
+                Statement settings(db, "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)");
+                settings.bind(1, "hide_extensions"); settings.bind(2, hideExtensions ? "1" : "0"); settings.insert();
+                settings.bind(1, "hide_full_path"); settings.bind(2, hideFullPath ? "1" : "0"); settings.insert();
+                db.exec("COMMIT;");
+            } catch (const std::exception&) { /* ignore save errors for display prefs */ }
+        }
         return 0;
     case WM_CONTEXTMENU:
         if (reinterpret_cast<HWND>(wp) == results) { copyMenu(lp); return 0; }
@@ -364,6 +399,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                 std::string value = reinterpret_cast<const char*>(sqlite3_column_text(settings.p, 1));
                 if (key == "scan_folder") lastScanFolder = wide(value);
                 else if (key == "scan_recursive") lastScanRecursive = value == "1";
+                else if (key == "hide_extensions") hideExtensions = value == "1";
+                else if (key == "hide_full_path") hideFullPath = value == "1";
             }
             if (rc != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(db.p));
         }
